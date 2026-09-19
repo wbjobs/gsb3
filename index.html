@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Web Worker 并行排序 · 可中断 · 实时进度</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #181f2e;
+    --panel2: #1f2839;
+    --border: #2b3550;
+    --text: #e6ecf7;
+    --muted: #8b97b0;
+    --accent: #4f9dff;
+    --green: #3ecf8e;
+    --yellow: #f2c94c;
+    --red: #ff6b6b;
+    --purple: #b388ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 8px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  label { color: var(--muted); font-size: 13px; }
+  select, button, input[type=number] {
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 7px 12px;
+    font-size: 13px;
+    outline: none;
+  }
+  button { cursor: pointer; font-weight: 600; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #081325; }
+  button.warn { background: var(--yellow); border-color: var(--yellow); color: #2b2300; }
+  button.danger { background: var(--red); border-color: var(--red); color: #2b0000; }
+  .sep { width: 1px; height: 26px; background: var(--border); margin: 0 2px; }
+  .stat {
+    display: inline-block;
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 4px 10px;
+    margin: 2px 6px 2px 0;
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+  }
+  .stat b { color: var(--accent); }
+  .stat.good b { color: var(--green); }
+  .stat.bad b { color: var(--red); }
+  canvas { display: block; width: 100%; border-radius: 8px; background: #101625; }
+  #legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  #log {
+    height: 150px; overflow-y: auto;
+    background: #0c111c; border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font: 11px/1.55 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #log .err { color: var(--red); }
+  #log .ok { color: var(--green); }
+  #log .warn { color: var(--yellow); }
+  #log .dim { color: var(--muted); }
+  .interact {
+    user-select: none;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-top: 10px;
+  }
+  .ripple {
+    display: inline-block;
+    margin: 6px 8px 6px 0;
+    padding: 8px 14px;
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    cursor: pointer;
+    transition: transform .08s, border-color .08s;
+  }
+  .ripple:active { transform: scale(.94); border-color: var(--green); }
+  #scrollpad {
+    height: 70px; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; margin-top: 8px;
+    font-size: 12px; color: var(--muted);
+  }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Web Worker 并行排序（分块 + 归并，可中断）</h1>
+  <p class="sub">生成随机整数 → N 个 Worker 并行分块排序 → 主调度器驱动树状归并。全程 TypedArray + Canvas，主线程分片执行（requestIdleCallback），不阻塞交互。</p>
+
+  <div class="panel">
+    <div class="row">
+      <label>元素数量
+        <input id="count" type="number" value="1000000" min="1000" step="100000" style="width:120px">
+      </label>
+      <label>Worker 数
+        <select id="workers">
+          <option value="4">4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+          <option value="7">7</option>
+          <option value="8" selected>8</option>
+        </select>
+      </label>
+      <span class="sep"></span>
+      <button id="btnStart" class="primary">▶ 开始排序</button>
+      <button id="btnPause" class="warn" disabled>⏸ 暂停</button>
+      <button id="btnCancel" class="danger" disabled>✖ 取消</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>故障注入
+        <select id="fault">
+          <option value="none">无故障</option>
+          <option value="createfail">创建 Worker 失败（降级单 Worker / 主线程）</option>
+          <option value="freeze">运行中冻结（不响应心跳，模拟消息丢失）</option>
+          <option value="stall">运行中静默（继续算但不上报进度）</option>
+          <option value="crash">运行中崩溃退出</option>
+        </select>
+      </label>
+      <label>目标
+        <select id="faultTarget"><option value="0">Worker #0</option></select>
+      </label>
+      <button id="btnInject" disabled>💉 注入</button>
+      <span style="color:var(--muted);font-size:12px">“创建失败”在开始时生效；其余在排序中随时注入。</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="margin-bottom:8px">
+      <span class="stat">阶段 <b id="phase">空闲</b></span>
+      <span class="stat">整体进度 <b id="pct">0.0%</b></span>
+      <span class="stat">已完成任务 <b id="doneJobs">0/0</b></span>
+      <span class="stat">耗时 <b id="elapsed">0.00s</b></span>
+      <span class="stat">FPS <b id="fps">--</b></span>
+      <span class="stat" id="modeStat">执行模式 <b>—</b></span>
+      <span class="stat" id="cancelStat" style="display:none">终止耗时 <b>—</b></span>
+    </div>
+    <canvas id="chart" height="320"></canvas>
+    <div id="legend"></div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>响应性测试（排序进行时应可随时点击 / 滚动）</h2>
+      <div class="interact">
+        <span class="ripple" id="btnClick1">点我计数 0</span>
+        <span class="ripple" id="btnClick2">点我计数 0</span>
+        <span class="ripple" id="btnAnim">CSS 动画流畅？→</span>
+      </div>
+      <div id="scrollpad">可滚动区域：排序时滚动试试……<br></div>
+    </div>
+    <div class="panel">
+      <h2>事件日志</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>校验结果</h2>
+    <div id="verify" style="color:var(--muted);font-size:13px">尚未运行。</div>
+  </div>
+</div>
+
+<script src="sort-core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
