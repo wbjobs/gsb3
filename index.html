@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>百万整数 · Web Worker 并行排序</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #131a2e; --panel2: #0f1626;
+    --border: #243049; --text: #e5e7eb; --muted: #8b95a7;
+    --accent: #3b82f6; --green: #22c55e; --red: #ef4444; --amber: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;
+  }
+  .panel h2 { font-size: 13px; color: var(--muted); margin: 0 0 10px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .06em; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  select, button {
+    background: #1b2540; color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  select:hover, button:hover:not(:disabled) { border-color: #3b4a6b; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); }
+  button.danger { background: #7f1d1d; border-color: #991b1b; }
+  button.ok { background: #14532d; border-color: #166534; }
+  label.cb { display: inline-flex; align-items: center; gap: 6px; color: var(--muted);
+    font-size: 12.5px; margin-right: 4px; cursor: pointer; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px; }
+  .stat { background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 12px; }
+  .stat .k { font-size: 11px; color: var(--muted); }
+  .stat .v { font-family: ui-monospace, monospace; font-size: 15px; margin-top: 2px; }
+  #chart { width: 100%; height: 340px; display: block; border-radius: 8px;
+    background: var(--panel2); }
+  #log {
+    height: 150px; overflow-y: auto; background: #080d1a;
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-family: ui-monospace, monospace; font-size: 11.5px; color: #a8b3c7;
+  }
+  #result { font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .scrollpad { height: 60vh; border: 1px dashed var(--border); border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; color: var(--muted);
+    margin-top: 14px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>百万随机整数 · Web Worker 并行排序</h1>
+  <div class="sub">分块排序 + k 路归并 · 可暂停 / 继续 / 取消 · Worker 故障自动降级 · Canvas 实时进度</div>
+
+  <div class="panel">
+    <h2>控制</h2>
+    <div class="row">
+      <label>数据量
+        <select id="size">
+          <option value="1000000" selected>100 万</option>
+          <option value="2000000">200 万</option>
+          <option value="500000">50 万</option>
+          <option value="100000">10 万</option>
+        </select>
+      </label>
+      <label>Worker 数
+        <select id="workerCount">
+          <option value="0" selected>自动 (4–8)</option>
+          <option value="4">4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+        </select>
+      </label>
+      <button id="btnGenerate" class="primary">① 生成数据</button>
+      <button id="btnStart" class="ok" disabled>② 开始排序</button>
+      <button id="btnPause" disabled>⏸ 暂停</button>
+      <button id="btnCancel" class="danger" disabled>✕ 取消</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span style="color:var(--muted);font-size:12px">故障注入（验证异常链路）：</span>
+      <label class="cb"><input type="checkbox" id="chFailCreate">前 2 次创建 Worker 失败</label>
+      <label class="cb"><input type="checkbox" id="chFailCreateAll">Worker 创建全部失败</label>
+      <label class="cb"><input type="checkbox" id="chOom">#0 块 Worker 内存不足</label>
+      <label class="cb"><input type="checkbox" id="chStall">#0 块 Worker 卡死（验证强杀）</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnTickle">👆 点我测试主线程响应</button>
+      <span id="tickleCount" style="color:var(--muted);font-size:12px"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>状态</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">阶段</div><div class="v" id="stateText">空闲</div></div>
+      <div class="stat"><div class="k">整体进度</div><div class="v" id="overallText">0.00%</div></div>
+      <div class="stat"><div class="k">分块排序</div><div class="v" id="sortPhaseText">-</div></div>
+      <div class="stat"><div class="k">归并</div><div class="v" id="mergePhaseText">-</div></div>
+      <div class="stat"><div class="k">执行模式</div><div class="v" id="modeText">-</div></div>
+      <div class="stat"><div class="k">已用时间</div><div class="v" id="elapsedText">-</div></div>
+      <div class="stat"><div class="k">取消停止耗时</div><div class="v" id="stopLatencyText">-</div></div>
+      <div class="stat"><div class="k">帧间隔</div><div class="v" id="frameMsText">-</div></div>
+    </div>
+    <div class="stat" style="margin-top:10px"><div class="k">结果</div><div class="v" id="resultText" style="margin-top:4px">-</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>实时进度（柱状图）</h2>
+    <canvas id="chart"></canvas>
+    <div class="hint">蓝=排序中 · 绿=完成 · 灰=排队/取消；顶部渐变条为整体进度。排序期间尝试滚动页面、点击上方按钮。</div>
+  </div>
+
+  <div class="panel">
+    <h2>事件日志（降级 / 重试 / 强杀）</h2>
+    <div id="log"></div>
+  </div>
+
+  <div class="scrollpad">↓ 排序时滚动到这里，验证页面依然流畅可交互 ↓</div>
+</div>
+
+<script src="js/mergesort.js"></script>
+<script src="js/kway.js"></script>
+<script src="js/pool.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
